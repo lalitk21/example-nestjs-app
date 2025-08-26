@@ -1,0 +1,102 @@
+name: Deploy to Amazon ECS
+
+on:
+  push:
+    branches: 
+      - develop
+      - release
+
+env:
+  AWS_REGION: us-west-1                   # set this to your preferred AWS region, e.g. us-west-1
+  ECS_SERVICE: sparkrock                 # set this to your Amazon ECS service name
+  CONTAINER_NAME: sparkrock           # set this to the name of the container in the
+                                               # containerDefinitions section of your task definition
+
+permissions:
+  contents: read
+  
+jobs:
+  setup-job:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-variable.outputs.envrionment }}
+    steps:
+      - name: Set test variable
+        id: set-variable
+        run: |
+          if [[ $GITHUB_REF_NAME == 'release' ]]; then
+            echo "::set-output name=envrionment::production"
+          else
+            echo "::set-output name=envrionment::UAT"
+          fi
+        shell: bash    
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20.x] 
+    needs: [setup-job]
+    environment: ${{needs.setup-job.outputs.environment}}
+    steps:
+    - name: Set environment for branch
+      run: |
+          if [[ $GITHUB_REF_NAME == 'release' ]]; then
+              echo "ECR_REPOSITORY=sparkrock/sparkrock_prod" >> "$GITHUB_ENV"
+              echo "ECS_CLUSTER=sparkrock-prod" >> "$GITHUB_ENV"
+              echo "ECS_TASK_DEFINITION=.aws/sparkrock-prod.json" >> "$GITHUB_ENV"
+          else
+              echo "ECR_REPOSITORY=sparkrock/sparkrock_uat" >> "$GITHUB_ENV"
+              echo "ECS_CLUSTER=sparkrock-uat" >> "$GITHUB_ENV"
+              echo "ECS_TASK_DEFINITION=.aws/sparkrock-uat.json" >> "$GITHUB_ENV"
+          fi 
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }} # Specify the Node.js version
+        cache: 'npm' # Optionally cache npm dependencies
+    - run: npm ci # Install project dependencies
+    - run: npm test # Run tests
+    #- run: npm run build # Run tests
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        # Build a docker container and
+        # push it to ECR so that it can
+        # be deployed to ECS.
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Fill in the new image ID in the Amazon ECS task definition
+      id: task-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: ${{ env.ECS_TASK_DEFINITION }}
+        container-name: ${{ env.CONTAINER_NAME }}
+        image: ${{ steps.build-image.outputs.image }}
+
+    - name: Deploy Amazon ECS task definition
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: ${{ steps.task-def.outputs.task-definition }}
+        service: ${{ env.ECS_SERVICE }}
+        cluster: ${{ env.ECS_CLUSTER }}
+        wait-for-service-stability: true
